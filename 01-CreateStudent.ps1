@@ -1,3 +1,6 @@
+# 01-CreateStudent.ps1
+# Creates the student account or enables it without resetting an existing password.
+# Ensures student is a standard user, not an administrator.
 
 $ErrorActionPreference = "Stop"
 
@@ -9,33 +12,37 @@ $user = Get-LocalUser -Name $Name -ErrorAction SilentlyContinue
 if (-not $user) {
     New-LocalUser -Name $Name `
         -Password $Password `
-        -Description "Student CALIBRATE account" | Out-Null
+        -Description "Student CALIBRATE account" `
+        -PasswordNeverExpires | Out-Null
+
+    Write-Host "Student account created." -ForegroundColor Green
 } else {
-    Set-LocalUser -Name $Name -Password $Password
+    Write-Host "Student account already exists; password unchanged." -ForegroundColor Yellow
 }
 
 Enable-LocalUser -Name $Name
 Set-LocalUser -Name $Name -PasswordNeverExpires $true
-net.exe user $Name /passwordreq:yes
 
-# Ensure standard-user membership.
-try {
+# Ensure the student belongs to the standard Users group.
+$StudentSid = (Get-LocalUser -Name $Name).SID.Value
+$UsersMembers = Get-LocalGroupMember -Group "Users" -ErrorAction SilentlyContinue
+
+if (-not ($UsersMembers | Where-Object { $_.SID.Value -eq $StudentSid })) {
     Add-LocalGroupMember -Group "Users" -Member $Name
-} catch {
-    if (-not (Get-LocalGroupMember -Group "Users" |
-        Where-Object { $_.SID.Value -eq (Get-LocalUser $Name).SID.Value })) {
-        throw
-    }
 }
 
-# Ensure the student is not an administrator.
-try {
-    Remove-LocalGroupMember -Group "Administrators" -Member $Name
-} catch {}
+# Ensure the student is not a member of Administrators.
+$AdminMembers = Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue
 
-Get-LocalUser $Name |
-    Select-Object Name, Enabled, PasswordRequired
+if ($AdminMembers | Where-Object { $_.SID.Value -eq $StudentSid }) {
+    Remove-LocalGroupMember -Group "Administrators" -Member $Name
+}
+
+Get-LocalUser -Name $Name |
+    Select-Object Name, Enabled, PasswordRequired, PasswordExpires
 
 Write-Host "Student account configured." -ForegroundColor Green
 Write-Host "Username: $env:COMPUTERNAME\$Name"
-Write-Host "Password: student"
+if (-not $user) {
+    Write-Host "Initial password: student"
+}

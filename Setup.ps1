@@ -1,5 +1,6 @@
+
 # Setup.ps1
-# Run as Administrator
+# Runs from any folder and requests Administrator permission.
 
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
@@ -8,8 +9,17 @@ $Principal = New-Object Security.Principal.WindowsPrincipal(
     [Security.Principal.WindowsIdentity]::GetCurrent()
 )
 
-if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw "Please run PowerShell as Administrator."
+if (-not $Principal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)) {
+    Start-Process powershell.exe `
+        -Verb RunAs `
+        -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", "`"$PSCommandPath`""
+        )
+    exit
 }
 
 $Modules = @(
@@ -28,14 +38,8 @@ foreach ($Module in $Modules) {
     }
 
     Write-Host "`nRunning $Module..." -ForegroundColor Cyan
-
-    try {
-        & $Path
-    }
-    catch {
-        throw "Setup stopped at ${Module}: $($_.Exception.Message)"
-    }
+    & $Path
 }
 
 Write-Host "`nSetup completed successfully." -ForegroundColor Green
-Write-Host "Please restart the computer and login as student to test."
+Write-Host "Restart the computer and test the student account."
