@@ -1,161 +1,179 @@
+
 # 04-WindowsRestrictions.ps1
-# Run as Administrator
-# This version automatically creates the student profile if it doesn't exist
+# Run as Administrator.
+# Applies Windows restrictions to the student account only.
+# Does not replace the Windows shell or create a duplicate app launcher.
+# If the student profile does not exist, log in as student once and rerun.
 
 $ErrorActionPreference = "Stop"
 
-$studentUser   = "student"
-$studentPass   = "student"
-$calibrateExe  = "C:\Users\student\AppData\Local\Programs\CALIBRATE\CALIBRATE-PREPROD.exe"
-$hiveName      = "StudentRestrictionsTemp"
-$hivePath      = "HKU\$hiveName"
+$StudentName = "student"
+$ProfilePath = "C:\Users\$StudentName"
+$HiveName = "StudentRestrictionsTemp"
+$HivePath = "HKU\$HiveName"
 
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host " Windows Restrictions for Student User" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
-# ---------- Force create student profile if missing ----------
-$studentProfileInfo = Get-CimInstance Win32_UserProfile |
-    Where-Object { $_.LocalPath -like "*\$studentUser" -and -not $_.Special }
+# Confirm administrator privileges.
+$Principal = New-Object Security.Principal.WindowsPrincipal(
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+)
 
-if (-not $studentProfileInfo -or -not (Test-Path "C:\Users\$studentUser\NTUSER.DAT")) {
-    Write-Host "Student profile not found. Creating it automatically..." -ForegroundColor Yellow
-
-    $securePass = ConvertTo-SecureString $studentPass -AsPlainText -Force
-    $cred = New-Object System.Management.Automation.PSCredential ("$env:COMPUTERNAME\$studentUser", $securePass)
-
-    # This forces Windows to create the full user profile
-    $proc = Start-Process -FilePath "cmd.exe" `
-        -ArgumentList "/c echo ProfileCreated" `
-        -Credential $cred `
-        -LoadUserProfile `
-        -Wait `
-        -WindowStyle Hidden `
-        -PassThru `
-        -ErrorAction SilentlyContinue
-
-    Start-Sleep -Seconds 3
-
-    # Refresh profile info
-    $studentProfileInfo = Get-CimInstance Win32_UserProfile |
-        Where-Object { $_.LocalPath -like "*\$studentUser" -and -not $_.Special }
+if (-not $Principal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)) {
+    throw "Please run PowerShell as Administrator."
 }
 
-if (-not $studentProfileInfo) {
-    throw "Failed to create student profile. Please login as student once manually."
+# Confirm the student account exists.
+$Student = Get-LocalUser -Name $StudentName -ErrorAction SilentlyContinue
+
+if (-not $Student) {
+    throw "The local account '$StudentName' does not exist. Run 01-CreateStudent.ps1 first."
 }
 
-$studentProfile = $studentProfileInfo.LocalPath
-$ntUserDat = Join-Path $studentProfile "NTUSER.DAT"
+# Find the student's actual Windows profile.
+$StudentProfileInfo = Get-CimInstance Win32_UserProfile |
+    Where-Object {
+        $_.SID -eq $Student.SID.Value -and -not $_.Special
+    } |
+    Select-Object -First 1
 
-Write-Host "Student profile: $studentProfile" -ForegroundColor Green
-
-if (-not (Test-Path $ntUserDat)) {
-    throw "NTUSER.DAT still missing after profile creation attempt."
+if (-not $StudentProfileInfo) {
+    throw "Student profile not found. Sign in to Windows once as '$StudentName', sign out, then rerun this script."
 }
 
-if ($studentProfileInfo.Loaded) {
-    throw "Student profile is currently loaded. Sign out of student and try again."
+$ProfilePath = $StudentProfileInfo.LocalPath
+$NtUserDat = Join-Path $ProfilePath "NTUSER.DAT"
+
+if (-not (Test-Path -LiteralPath $NtUserDat -PathType Leaf)) {
+    throw "Student registry file not found: $NtUserDat"
 }
 
-# ---------- Load hive ----------
+# Do not load a second copy if the student is currently signed in.
+if ($StudentProfileInfo.Loaded) {
+    throw "The student profile is currently loaded. Sign out as student and rerun this script."
+}
+
+# Ensure the temporary hive name is not already in use.
+& reg.exe query $HivePath *> $null
+if ($LASTEXITCODE -eq 0) {
+    throw "Temporary registry hive $HivePath is already loaded. Resolve that before continuing."
+}
+
+Write-Host "Student profile: $ProfilePath" -ForegroundColor Green
 Write-Host "Loading student registry hive..." -ForegroundColor Yellow
-$result = & reg.exe load $hivePath $ntUserDat 2>&1
+
+$LoadResult = & reg.exe load $HivePath $NtUserDat 2>&1
+
 if ($LASTEXITCODE -ne 0) {
-    throw "Failed to load hive: $result"
+    throw "Failed to load student registry hive: $LoadResult"
 }
 
 try {
-    $explorerPolicy = "$hivePath\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
-    $systemPolicy   = "$hivePath\Software\Microsoft\Windows\CurrentVersion\Policies\System"
-    $winlogonKey    = "$hivePath\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
-    $advancedKey    = "$hivePath\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-    $searchKey      = "$hivePath\Software\Microsoft\Windows\CurrentVersion\Search"
+    $ExplorerPolicy = "$HivePath\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+    $SystemPolicy   = "$HivePath\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+    $AdvancedKey    = "$HivePath\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+    $SearchKey      = "$HivePath\Software\Microsoft\Windows\CurrentVersion\Search"
 
-    foreach ($key in @($explorerPolicy, $systemPolicy, $winlogonKey, $advancedKey, $searchKey)) {
-        & reg.exe add $key /f | Out-Null
+    # Create policy keys if missing.
+    foreach ($Key in @(
+        $ExplorerPolicy,
+        $SystemPolicy,
+        $AdvancedKey,
+        $SearchKey
+    )) {
+        & reg.exe add $Key /f | Out-Null
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create registry key: $Key"
+        }
     }
 
-    Write-Host "Applying restrictions..." -ForegroundColor Yellow
+    Write-Host "Applying student restrictions..." -ForegroundColor Yellow
 
-    # Explorer restrictions
-    $explorerSettings = @{
-        NoDesktop                  = 1
-        NoRun                      = 1
-        NoFind                     = 1
-        NoClose                    = 1
-        NoSetTaskbar               = 1
-        NoTrayItemsDisplay         = 1
-        NoWinKeys                  = 1
-        NoTaskSwitches             = 1
-        NoViewContextMenu          = 1
-        NoLogoff                   = 1
-        NoChangeStartMenu          = 1
-        HideClock                  = 1
-        NoStartMenuSubFolders      = 1
-        NoStartMenuPinnedList      = 1
-        NoStartMenuMFUprogramsList = 1
-        NoControlPanel             = 1
+    # Restrict selected Explorer and Start menu features for student.
+    # These settings do not prevent every possible way to launch programs.
+    $ExplorerSettings = @{
+        NoRun                      = 1  # Disable the Run command.
+        NoFind                     = 1  # Disable the legacy Find/Search command.
+        NoViewContextMenu          = 1  # Disable Explorer desktop/file context menus.
+        NoControlPanel             = 1  # Hide Control Panel entry points.
+        NoSetTaskbar               = 1  # Restrict taskbar/Start menu settings.
+        NoChangeStartMenu          = 1  # Prevent Start menu customization.
+        NoStartMenuPinnedList      = 1  # Hide the pinned-programs list.
+        NoStartMenuMFUprogramsList = 1  # Hide frequently used programs.
+        NoStartMenuSubFolders      = 1  # Hide Start menu subfolders.
+        NoWinKeys                  = 1  # Disable Windows-key shortcuts.
+        NoTaskSwitches             = 1  # Disable Alt+Tab task switching.
+        NoDesktop                  = 1  # Hide desktop icons.
     }
 
-    foreach ($item in $explorerSettings.GetEnumerator()) {
-        & reg.exe add $explorerPolicy /v $item.Key /t REG_DWORD /d $item.Value /f | Out-Null
+    foreach ($Item in $ExplorerSettings.GetEnumerator()) {
+        & reg.exe add $ExplorerPolicy `
+            /v $Item.Key /t REG_DWORD /d $Item.Value /f | Out-Null
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to apply Explorer policy: $($Item.Key)"
+        }
     }
 
-    # System
-    & reg.exe add $systemPolicy /v NoControlPanel /t REG_DWORD /d 1 /f | Out-Null
-    & reg.exe add $systemPolicy /v DisableTaskMgr /t REG_DWORD /d 1 /f | Out-Null
+    # Restrict Task Manager and Control Panel for student.
+    & reg.exe add $SystemPolicy /v DisableTaskMgr /t REG_DWORD /d 1 /f | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to disable Task Manager."
+    }
 
-    # Taskbar buttons
-    $advancedSettings = @{
+    & reg.exe add $SystemPolicy /v NoControlPanel /t REG_DWORD /d 1 /f | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to restrict Control Panel."
+    }
+
+    # Hide selected taskbar buttons/search entry points.
+    # Windows may ignore some values depending on its version.
+    $AdvancedSettings = @{
         ShowTaskViewButton = 0
         TaskbarDa          = 0
         TaskbarMn          = 0
         TaskbarSearch      = 0
     }
 
-    foreach ($item in $advancedSettings.GetEnumerator()) {
-        & reg.exe add $advancedKey /v $item.Key /t REG_DWORD /d $item.Value /f | Out-Null
+    foreach ($Item in $AdvancedSettings.GetEnumerator()) {
+        & reg.exe add $AdvancedKey `
+            /v $Item.Key /t REG_DWORD /d $Item.Value /f | Out-Null
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to apply taskbar setting: $($Item.Key)"
+        }
     }
 
-    # Search
-    & reg.exe add $searchKey /v SearchboxTaskbarMode /t REG_DWORD /d 0 /f | Out-Null
-    & reg.exe add $searchKey /v BingSearchEnabled /t REG_DWORD /d 0 /f | Out-Null
-    & reg.exe add $searchKey /v CortanaConsent /t REG_DWORD /d 0 /f | Out-Null
-
-    # Force Shell
-    if (Test-Path $calibrateExe) {
-        & reg.exe add $winlogonKey /v Shell /t REG_SZ /d "`"$calibrateExe`"" /f | Out-Null
-        Write-Host "Shell set to CALIBRATE app" -ForegroundColor Green
-    }
-    else {
-        Write-Warning "CALIBRATE.exe not found yet. Shell will be set later when app is installed."
+    # Hide the Windows taskbar search box where supported.
+    & reg.exe add $SearchKey /v SearchboxTaskbarMode /t REG_DWORD /d 0 /f | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to configure taskbar search."
     }
 
-    Write-Host "All restrictions applied" -ForegroundColor Green
+    Write-Host "Student restrictions applied successfully." -ForegroundColor Green
 }
 finally {
-    [System.GC]::Collect()
-    [System.GC]::WaitForPendingFinalizers()
-    Start-Sleep -Seconds 1
-    & reg.exe unload $hivePath | Out-Null
-    Write-Host "Hive unloaded" -ForegroundColor Green
-}
+    # Always unload the temporary registry hive.
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
 
-# Startup shortcut (backup)
-$startupFolder = Join-Path $studentProfile "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-New-Item -Path $startupFolder -ItemType Directory -Force | Out-Null
+    $UnloadResult = & reg.exe unload $HivePath 2>&1
 
-if (Test-Path $calibrateExe) {
-    $shortcutPath = Join-Path $startupFolder "CALIBRATE.lnk"
-    $wsh = New-Object -ComObject WScript.Shell
-    $shortcut = $wsh.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = $calibrateExe
-    $shortcut.WorkingDirectory = Split-Path $calibrateExe
-    $shortcut.Save()
-    Write-Host "Startup shortcut created" -ForegroundColor Green
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not unload registry hive $HivePath. Details: $UnloadResult"
+    }
+    else {
+        Write-Host "Student registry hive unloaded." -ForegroundColor Green
+    }
 }
 
 Write-Host ""
-Write-Host "COMPLETED SUCCESSFULLY" -ForegroundColor Green
-Write-Host "You can now restart and login as student."
+Write-Host "COMPLETED." -ForegroundColor Green
+Write-Host "Restrictions apply to the student profile only."
+Write-Host "CALIBRATE launching remains managed by 03-LaunchApp.ps1."
+Write-Host "Sign in as student to test the restrictions."
