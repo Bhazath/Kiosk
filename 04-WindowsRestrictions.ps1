@@ -1,11 +1,12 @@
 
 # 04-WindowsRestrictions.ps1
-# Run from Setup.ps1 as Administrator
+# Run as Administrator while signed in to the admin account.
+# Signs out the student session, unloads the profile, and applies restrictions.
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host " Windows Restrictions for Student User" -ForegroundColor Cyan
+Write-Host " Student Windows Restrictions" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
 # 1. Check administrator privileges
@@ -15,191 +16,188 @@ $Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
 if (-not $Principal.IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )) {
-    throw "Run Setup.ps1 as Administrator."
+    throw "Run this script as Administrator."
 }
 
-# 2. Check student account
+# 2. Verify the student account
 $Student = "student"
-$StudentAccount = Get-LocalUser -Name $Student -ErrorAction SilentlyContinue
+$Account = Get-LocalUser -Name $Student -ErrorAction SilentlyContinue
 
-if (-not $StudentAccount) {
-    throw "Student account does not exist. Run 01-CreateStudent.ps1 first."
+if (-not $Account) {
+    throw "Student account not found. Run 01-CreateStudent.ps1 first."
 }
 
-$StudentSid = $StudentAccount.SID.Value
+$Sid = $Account.SID.Value
+
+# 3. Sign out active student sessions only
+Write-Host "Checking for active student sessions..." -ForegroundColor Yellow
+
+$QuserOutput = quser 2>$null
+
+if ($LASTEXITCODE -eq 0 -and $QuserOutput) {
+    foreach ($Line in ($QuserOutput | Select-Object -Skip 1)) {
+        # Handles the optional leading > used for the current session.
+        if ($Line -match '^\s*>?\s*(\S+)\s+(\S+)?\s*(\d+)\s+') {
+            $SessionUser = $Matches[1]
+            $SessionId = [int]$Matches[3]
+
+            if ($SessionUser -ieq $Student) {
+                Write-Host "Signing out student session ID $SessionId..." -ForegroundColor Yellow
+                & logoff.exe $SessionId
+
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "Could not sign out session $SessionId. Windows may still be closing it."
+                }
+            }
+        }
+    }
+}
+
+# 4. Wait for Windows to unload the student profile
+Write-Host "Waiting for student profile to unload..." -ForegroundColor Yellow
+
+$Deadline = (Get-Date).AddSeconds(45)
+
+do {
+    Start-Sleep -Seconds 2
+
+    $LoadedProfile = Get-CimInstance Win32_UserProfile |
+        Where-Object { $_.SID -eq $Sid -and $_.Loaded }
+
+} while ($LoadedProfile -and (Get-Date) -lt $Deadline)
+
+if ($LoadedProfile) {
+    throw "Student profile remains loaded. Check for disconnected student sessions and retry."
+}
+
+# 5. Find the student profile
 $Profile = Get-CimInstance Win32_UserProfile |
-    Where-Object { $_.SID -eq $StudentSid }
+    Where-Object { $_.SID -eq $Sid }
 
-$ProfilePath = Join-Path $env:SystemDrive "Users\$Student"
-
-if ($Profile -and $Profile.LocalPath) {
-    $ProfilePath = $Profile.LocalPath
+if (-not $Profile) {
+    throw "Student profile not found. Sign in as student once, sign out, and rerun."
 }
 
+$ProfilePath = $Profile.LocalPath
 $NtUserDat = Join-Path $ProfilePath "NTUSER.DAT"
-
-# 3. Create profile if missing
-if (-not (Test-Path $NtUserDat)) {
-    Write-Host "Creating student profile..." -ForegroundColor Yellow
-
-    if (-not ("StudentProfileNative" -as [type])) {
-        Add-Type @"
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-
-public static class StudentProfileNative
-{
-    [DllImport("userenv.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern int CreateProfile(
-        string pszUserSid,
-        string pszUserName,
-        StringBuilder pszProfilePath,
-        uint cchProfilePath
-    );
-}
-"@
-    }
-
-    $Buffer = New-Object System.Text.StringBuilder 260
-    $Result = [StudentProfileNative]::CreateProfile(
-        $StudentSid, $Student, $Buffer, [uint32]$Buffer.Capacity
-    )
-
-    if ($Result -ne 0 -and -not (Test-Path $NtUserDat)) {
-        throw ("Windows could not create the student profile. HRESULT: 0x{0:X8}" -f ($Result -band 0xFFFFFFFF))
-    }
-
-    if ($Buffer.Length -gt 0) {
-        $ProfilePath = $Buffer.ToString()
-    }
-
-    $NtUserDat = Join-Path $ProfilePath "NTUSER.DAT"
-}
 
 if (-not (Test-Path $NtUserDat)) {
     throw "Student NTUSER.DAT not found at '$NtUserDat'."
 }
 
-# 4. Check whether student profile is currently loaded
-$Profile = Get-CimInstance Win32_UserProfile |
-    Where-Object { $_.SID -eq $StudentSid }
+# 6. Load the student registry hive
+$Hive = "StudentRestrictionsTemp"
+$Root = "Registry::HKEY_USERS\$Hive"
 
-if ($Profile -and $Profile.Loaded) {
-    throw "Student profile is currently loaded. Sign out student and rerun Setup.ps1."
+if (Test-Path $Root) {
+    throw "Temporary registry hive HKU\$Hive already exists. Restart Windows and retry."
 }
 
-$HiveName = "StudentRestrictionsTemp"
-$HivePath = "Registry::HKEY_USERS\$HiveName"
-
-if (Test-Path $HivePath) {
-    throw "Temporary registry hive HKU\$HiveName already exists. Restart Windows and retry."
-}
-
-# 5. Load student registry hive
 Write-Host "Loading student registry..." -ForegroundColor Yellow
 
-& reg.exe load "HKU\$HiveName" "$NtUserDat"
+& reg.exe load "HKU\$Hive" "$NtUserDat"
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Failed to load NTUSER.DAT. Ensure the student profile is not in use, then retry."
+    throw "Could not load student registry. Check whether another process has locked NTUSER.DAT."
 }
 
 try {
-    $UserRoot = "Registry::HKEY_USERS\$HiveName"
-
-    # 6. Explorer restrictions
-    $ExplorerPath = "$UserRoot\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
-    New-Item -Path $ExplorerPath -Force | Out-Null
+    # 7. Explorer and Start menu restrictions
+    $Explorer = "$Root\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+    New-Item -Path $Explorer -Force | Out-Null
 
     $ExplorerSettings = @{
         NoRun                      = 1
         NoFind                     = 1
-        NoViewContextMenu          = 1
         NoControlPanel             = 1
+        NoViewContextMenu          = 1
+        NoTrayContextMenu          = 1
         NoSetTaskbar               = 1
         NoChangeStartMenu          = 1
         NoStartMenuPinnedList      = 1
         NoStartMenuMFUprogramsList = 1
         NoStartMenuSubFolders      = 1
         NoWinKeys                  = 1
-        NoTaskSwitches             = 1
+        NoViewOnDrive              = 67108863
+        NoDrives                   = 67108863
         NoDesktop                  = 1
     }
 
-    foreach ($Setting in $ExplorerSettings.GetEnumerator()) {
-        New-ItemProperty -Path $ExplorerPath `
-            -Name $Setting.Key -Value $Setting.Value `
-            -PropertyType DWord -Force | Out-Null
+    foreach ($Entry in $ExplorerSettings.GetEnumerator()) {
+        New-ItemProperty -Path $Explorer `
+            -Name $Entry.Key `
+            -Value $Entry.Value `
+            -PropertyType DWord `
+            -Force | Out-Null
     }
 
-    # 7. System restrictions
-    $SystemPath = "$UserRoot\Software\Microsoft\Windows\CurrentVersion\Policies\System"
-    New-Item -Path $SystemPath -Force | Out-Null
+    # Hide all Windows Settings pages
+    New-ItemProperty -Path $Explorer `
+        -Name "SettingsPageVisibility" `
+        -Value "hide:*" `
+        -PropertyType String `
+        -Force | Out-Null
 
-    New-ItemProperty -Path $SystemPath `
-        -Name "DisableTaskMgr" -Value 1 `
-        -PropertyType DWord -Force | Out-Null
+    # 8. System restrictions — Task Manager intentionally NOT blocked
+    $System = "$Root\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+    New-Item -Path $System -Force | Out-Null
 
-    New-ItemProperty -Path $SystemPath `
-        -Name "NoControlPanel" -Value 1 `
-        -PropertyType DWord -Force | Out-Null
-
-    Write-Host "Main student restrictions applied." -ForegroundColor Green
-
-    # 8. Optional taskbar settings
-    $AdvancedPath = "$UserRoot\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-
-    try {
-        if (Test-Path $AdvancedPath) {
-            $AdvancedSettings = @{
-                ShowTaskViewButton = 0
-                TaskbarDa          = 0
-                TaskbarMn          = 0
-                TaskbarSearch      = 0
-            }
-
-            foreach ($Setting in $AdvancedSettings.GetEnumerator()) {
-                New-ItemProperty -Path $AdvancedPath `
-                    -Name $Setting.Key -Value $Setting.Value `
-                    -PropertyType DWord -Force -ErrorAction Stop | Out-Null
-            }
-        } else {
-            Write-Warning "Advanced key missing; skipping optional taskbar settings."
-        }
-    }
-    catch {
-        Write-Warning "Optional taskbar settings skipped: $($_.Exception.Message)"
+    $SystemSettings = @{
+        NoDispCPL            = 1
+        NoDispBackgroundPage = 1
+        NoDispAppearancePage = 1
+        NoDispScrSavPage     = 1
+        DisableRegistryTools = 1
     }
 
-    # Search button setting
-    try {
-        $SearchPath = "$UserRoot\Software\Microsoft\Windows\CurrentVersion\Search"
-        New-Item -Path $SearchPath -Force | Out-Null
+    foreach ($Entry in $SystemSettings.GetEnumerator()) {
+        New-ItemProperty -Path $System `
+            -Name $Entry.Key `
+            -Value $Entry.Value `
+            -PropertyType DWord `
+            -Force | Out-Null
+    }
 
-        New-ItemProperty -Path $SearchPath `
-            -Name "SearchboxTaskbarMode" -Value 0 `
-            -PropertyType DWord -Force | Out-Null
-    }
-    catch {
-        Write-Warning "Search taskbar setting skipped: $($_.Exception.Message)"
-    }
+    # 9. Disable Command Prompt for student
+    $CommandProcessor = "$Root\Software\Policies\Microsoft\Windows\System"
+    New-Item -Path $CommandProcessor -Force | Out-Null
+
+    New-ItemProperty -Path $CommandProcessor `
+        -Name "DisableCMD" `
+        -Value 2 `
+        -PropertyType DWord `
+        -Force | Out-Null
+
+    # 10. Disable Windows Installer for student
+    $InstallerPolicy = "$Root\Software\Policies\Microsoft\Windows\Installer"
+    New-Item -Path $InstallerPolicy -Force | Out-Null
+
+    New-ItemProperty -Path $InstallerPolicy `
+        -Name "DisableMSI" `
+        -Value 2 `
+        -PropertyType DWord `
+        -Force | Out-Null
+
+    Write-Host "Explorer restrictions applied." -ForegroundColor Green
+    Write-Host "Settings restrictions applied." -ForegroundColor Green
+    Write-Host "Command Prompt restriction applied." -ForegroundColor Green
+    Write-Host "Task Manager remains enabled." -ForegroundColor Green
 }
 finally {
-    # 9. Unload registry hive
+    # 11. Unload the temporary registry hive
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
 
-    & reg.exe unload "HKU\$HiveName"
+    & reg.exe unload "HKU\$Hive"
 
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Could not unload the temporary registry hive. Restart Windows before testing."
+        Write-Warning "Could not unload the registry hive. Restart Windows before testing."
     }
 }
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Green
-Write-Host " Student restrictions configuration ended" -ForegroundColor Green
+Write-Host " Restrictions configured" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
-Write-Host "Sign in as student to test the settings."
-Write-Host "Note: These settings do not fully lock down Windows or restrict every application."
+Write-Host "Sign in as student again to test the changes."
+Write-Host "These policies restrict common Windows interfaces, not every possible way to launch programs."
